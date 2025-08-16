@@ -1,3 +1,16 @@
+
 {
-    "python.analysis.typeCheckingMode": "basic"
+    // tell pylance where to find the source code
+  "python.analysis.extraPaths": ["./src"],
+
+// tell pylance which interpreter to use
+  "python.defaultInterpreterPath": ".venv/bin/python",
+
+    // Nice to have: format on save (works if you set Black in #2)
+  "editor.formatOnSave": true,
+  "python.formatting.provider": "black",
+  "ruff.format.enabled": true,
+  "ruff.lint.enable": true,
+  "ruff.lint.fixOnSave": true
+
 }

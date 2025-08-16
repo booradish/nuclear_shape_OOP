@@ -1,108 +1,160 @@
-
 # main analysis script
 
-# This script is designed to be paired with the nuclear_shape_analysis.py and main_shape_tools.py scritps 
-# Here lie the tools for cleaning the data and running the main analysis pipeline on data from CellProfiler csv. files 
+# This script is designed to be paired with the nuclear_shape_analysis.py and main_shape_tools.py scritps
+# Here lie the tools for cleaning the data and running the main analysis pipeline on data from CellProfiler csv. files
 
-# === import libraries =========================================================
-import pandas as pd  # For data manipulation
-import numpy as np  # For numerical operations
+# ------------Import libraries --------------------------------
+import argparse
 import os  # For file path operations
-from scipy import stats  # For statistical operations
-import sys  # For system-specific parameters and functions
+import json
+import datetime
+import pandas as pd  # For data manipulation and analysis
 
-# === Import classes ===============================================================
+# ------- Import custom modules ------------------------------------------------------------
 
 # Import the main analysis class from GitHub repository or local src folder
 # Import from src folder (if you have this structure)
 try:
     from src.nuclear_shape_analysis import Nuclear_Shape_Analysis
 except ImportError:
-    # If src folder doesn't exist, import directly
-    from nuclear_shape_OOP.src.nuclear_shape_analysis import Nuclear_Shape_Analysis
+    try:
+        from nuclear_shape_analysis import Nuclear_Shape_Analysis
+    except ImportError:
+        print("✗ Could not import Nuclear_Shape_Analysis from src/ or local directory.")
+        raise
 
-# === get data ================================================================
 
-# Add the current directory to Python path so we can import our modules
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+def parse_csv_list(s: str | None):
+    if not s:
+        return []
+    return [x.strip() for x in s.split(",") if x.strip()]
 
-# Define the file path
-file_path = "/Users/rosi_dakd/My Drive/Prasad_Lab/nuclear_shape/Data/20240815_HeLa_TMI_40X_output/2D_CellProfiler_output/"
 
-# Load the CSV files using the full path
-nuc_path = (file_path + "2D_3Channel_Output_FilteredNucleiMyo.csv")
-act_path = (file_path + "2D_3channel_Output_cellsAct.csv")
+def check_file(path: str, label: str) -> bool:
+    if not path or not os.path.exists(path):
+        print(f"✗ {label} file NOT found: {path}")
+        return False
+    print(f"✓ {label} file found: {path}")
+    return True
 
-problem_files_path = "/Users/rosi_dakd/My Drive/Prasad_Lab/nuclear_shape/Data/20240815_HeLa_TMI_40X_output//Users/rosi_dakd/My Drive (rdanzman@gmail.com)/Prasad_Lab/nuclear_shape/Data/20240815_HeLa_TMI_40X_output/2D_CellProfiler_output/Output_Segmentation_Images/20240815_HeLa_TMI_40X_MAX_Segmented_problemImages.tex"
 
-keep_columns = ['ImageNumber', 'ObjectNumber', 'FileName_Nuc']
+def build_parser():
+    p = argparse.ArgumentParser("Run nuclear–cell analysis pipeline")
+    p.add_argument("--nuc_path", required=True)
+    p.add_argument("--act_path", required=True)
+    p.add_argument("--problem_files_path", default=None)
+    p.add_argument(
+        "--keep_columns", default="ImageNumber,ObjectNumber,FileName_Nuc,FileName_Act"
+    )
+    p.add_argument("--features", default="")
+    p.add_argument("--file_column", default="FileName_Act")
+    p.add_argument("--pixel_size_um", type=float, default=None)
+    # optional: labeling overrides
+    p.add_argument("--cell_type", default=None)
+    p.add_argument("--treatment", default=None)
+    p.add_argument("--label_map", default=None)
+    p.add_argument(
+        "--output_dir", default="outputs/run", help="Folder to write CSV outputs"
+    )
+    return p
 
-# === Check if files exist ========================================================
 
-print("=== CHECKING FILE PATHS ===")
-for name, path in [("Nuclear", nuc_path), ("Actin", act_path)]:
-    if os.path.exists(path):
-        print(f"✓ {name} file found: {path}")
-    else:
-        print(f"✗ {name} file NOT found: {path}")
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
 
-if os.path.exists(problem_files_path):
-    print(f"✓ Problem files found: {problem_files_path}")
-else:
-    print(f"✗ Problem files NOT found: {problem_files_path}")
-    problem_files_path = None  # Set to None if file doesn't exist
+    print("=== CHECKING FILE PATHS ===")
+    ok = check_file(args.nuc_path, "Nuclear") & check_file(args.act_path, "Actin")
+    prob = args.problem_files_path
+    if prob and not os.path.exists(prob):
+        print(f"⚠ Problem files NOT found, continuing without: {prob}")
+        prob = None
+    if not ok:
+        print("✗ Aborting due to missing inputs.")
+        return 2
 
-# === Instantiate the analysis class ===============================================================
+    keep_columns = parse_csv_list(args.keep_columns)
+    features = parse_csv_list(args.features)
 
-print("\n=== Initializing Analysis ===")
-try:
+    print("\n=== Initializing Analysis ===")
     cp = Nuclear_Shape_Analysis(
-        nuc_path=nuc_path,
-        act_path=act_path,
+        nuc_path=args.nuc_path,
+        act_path=args.act_path,
         keep_columns=keep_columns,
-        problem_files_path=problem_files_path,
-        file_column='FileName_Act'
+        problem_files_path=prob,
+        file_column=args.file_column,
+        pixel_size_um=args.pixel_size_um,
+        default_cell_type=args.cell_type,
+        default_treatment=args.treatment,
+        label_map_path=args.label_map,
     )
     print("✓ Analysis class initialized successfully.")
-except Exception as e:
-    print(f"✗ Error initializing analysis class: {e}")
-    sys.exit(1)  # Exit if initialization fails
 
-# === Run pipeline ===============================================================
-
-print("\n=== Running Analysis Pipeline ===")
-try:
-    # Load and clean data
+    print("\n=== Running Analysis Pipeline ===")
     cp.load_and_clean()
     print("✓ Data loaded and cleaned successfully.")
 
-    # Trim features to keep only specified columns
-    cp.trim_features(['nuc_Area', 'nuc_AspectRatio', 'myo_Intensity_MeanIntensity'])
-    print("✓ Features trimmed successfully.")
+    if features:
+        cp.trim_features(features)
+        print("✓ Features trimmed successfully.")
+    else:
+        print("• No --features provided; keeping all numeric features by default.")
+        cp.trim_features([])
 
-    # Run statistical analysis
     cp.run_stats()
-    print("✓ Statistical analysis completed successfully.")
+    print("✓ Stats done.")
+    # cp.run_regression();   print("✓ Regression done.")
+    # cp.run_random_forest();print("✓ Importance done.")
 
-    # Run regression analysis
-    cp.run_regression()
-    print("✓ Regression analysis completed successfully.")
+    outdir = args.output_dir
+    os.makedirs(outdir, exist_ok=True)
 
-    # Run random forest analysis
-    cp.run_random_forest()
-    print("✓ Random forest analysis completed successfully.")
+    if cp.stats_results:
+        for name, tbl in cp.stats_results.items():
+            if isinstance(tbl, pd.DataFrame) and not tbl.empty:
+                tbl.to_csv(os.path.join(outdir, f"stats_{name}.csv"))
 
-except Exception as e:
-    print(f"✗ Error during analysis pipeline: {e}")
-    print(f"Error type: {type(e).__name__}")
-    import traceback
-    traceback.print_exc()  # Print the full traceback for debugging
+    # save dataframes to CSV
+    if cp.df_clean is not None:
+        cp.df_clean.to_csv(os.path.join(outdir, "clean_merged_df.csv"), index=False)
+    if cp.df_trimmed is not None:
+        cp.df_trimmed.to_csv(
+            os.path.join(outdir, "trimmed_features_df.csv"), index=False
+        )
 
-    try:
-        summary = cp.get_data_summary()
-        print(f"\nDebugging info - Current data summary: {summary}")
-    except Exception as e:
-        print(f"✗ Error getting data summary: {e}")
-        sys.exit(1)
+    # save stats
+    if cp.stats_results:
+        for name, tbl in cp.stats_results.items():
+            if isinstance(tbl, pd.DataFrame) and not tbl.empty:
+                tbl.to_csv(os.path.join(args.output_dir, f"stats_{name}.csv"))
+
+    # save regression results
+    if cp.regression_results is not None:
+        for name, df in cp.regression_results.items():
+            df.to_csv(os.path.join(outdir, f"regression_{name}.csv"), index=False)
+
+    # save random forest results
+    if cp.random_forest_results is not None:
+        cp.random_forest_results.to_csv(
+            os.path.join(outdir, "random_forest_importance.csv"), index=False
+        )
+
+    # save run metadata
+    meta = {
+        "nuc_path": args.nuc_path,
+        "act_path": args.act_path,
+        "pixel_size_um": args.pixel_size_um,
+        "cell_type": args.cell_type,
+        "treatment": args.treatment,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "n_rows_clean": int(cp.df_clean.shape[0]) if cp.df_clean is not None else 0,
+        "n_cols_clean": int(cp.df_clean.shape[1]) if cp.df_clean is not None else 0,
+    }
+    with open(os.path.join(outdir, "run_metadata.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print("✓ Pipeline finished.")
+    return 0
 
 
+if __name__ == "__main__":
+    raise SystemExit(main())
