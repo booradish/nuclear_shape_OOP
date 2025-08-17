@@ -56,6 +56,44 @@ def build_parser():
     p.add_argument(
         "--output_dir", default="outputs/run", help="Folder to write CSV outputs"
     )
+    # Which steps to run (comma list): stats,regress,importance,compare
+    p.add_argument(
+        "--run",
+        default="stats,importance",  # sensible default; add 'compare' when you want it
+        help="Comma-separated steps to run: stats,regress,importance,compare",
+    )
+
+    # Quality control options
+    p.add_argument(
+        "--qc_mode",
+        choices=["none", "robust"],
+        default="robust",
+        help="Outlier handling: none (no flagging) or robust (MAD+mitotic rule)",
+    )
+    p.add_argument(
+        "--qc_drop",
+        action="store_true",
+        help="If set, drop rows flagged by QC before analysis (default: drop when robust).",
+    )
+    p.add_argument(
+        "--qc_keep",
+        dest="qc_drop",
+        action="store_false",
+        help="Keep flagged rows (only mark qc_keep/qc_reason).",
+    )
+    p.set_defaults(qc_drop=True)
+
+    # Feature engineering toggles
+    p.add_argument(
+        "--no_aspect_ratio",
+        action="store_true",
+        help="Do not add nuc/act aspect ratio derived feature.",
+    )
+    p.add_argument(
+        "--no_convert_coords",
+        action="store_true",
+        help="Do not convert coordinate-like columns to microns.",
+    )
     return p
 
 
@@ -76,6 +114,9 @@ def main(argv=None) -> int:
     features = parse_csv_list(args.features)
 
     print("\n=== Initializing Analysis ===")
+
+    steps = set(s.strip() for s in args.run.split(",") if s.strip())
+
     cp = Nuclear_Shape_Analysis(
         nuc_path=args.nuc_path,
         act_path=args.act_path,
@@ -86,12 +127,41 @@ def main(argv=None) -> int:
         default_cell_type=args.cell_type,
         default_treatment=args.treatment,
         label_map_path=args.label_map,
+        qc_mode=args.qc_mode,
+        qc_drop=args.qc_drop,
+        add_aspect_ratio=not args.no_aspect_ratio,
     )
     print("✓ Analysis class initialized successfully.")
 
     print("\n=== Running Analysis Pipeline ===")
+
     cp.load_and_clean()
     print("✓ Data loaded and cleaned successfully.")
+
+    # Print a quick QC summary to the console
+    removed = cp.n_rows_before - cp.n_rows_after
+    pct = (removed / cp.n_rows_before * 100.0) if cp.n_rows_before else 0.0
+    print(
+        f"QC: {cp.n_rows_before:,} rows → {cp.n_rows_after:,} rows "
+        f"(removed {removed:,}, {pct:.2f}%)."
+    )
+
+    if getattr(cp, "qc_summary", None) is not None:
+        print("\nQC per group:")
+        print(cp.qc_summary.to_string(index=False))
+
+    # Save to output_dir
+    os.makedirs(args.output_dir, exist_ok=True)
+    if getattr(cp, "qc_summary", None) is not None:
+        cp.qc_summary.to_csv(
+            os.path.join(args.output_dir, "qc_summary.csv"), index=False
+        )
+
+    # Optional: save the flagged dataset before dropping outliers
+    if getattr(cp, "df_flags", None) is not None:
+        cp.df_flags.to_csv(
+            os.path.join(args.output_dir, "cleaned_with_flags.csv"), index=False
+        )
 
     if features:
         cp.trim_features(features)
@@ -100,11 +170,23 @@ def main(argv=None) -> int:
         print("• No --features provided; keeping all numeric features by default.")
         cp.trim_features([])
 
-    cp.run_stats()
-    print("✓ Stats done.")
-    # cp.run_regression();   print("✓ Regression done.")
-    # cp.run_random_forest();print("✓ Importance done.")
-
+    if "stats" in steps:
+        cp.run_stats()
+        print("✓ Stats done.")
+    if "regress" in steps:
+        cp.run_regression()
+        print("✓ Regression done.")
+    if "importance" in steps:
+        cp.run_random_forest()
+        print("✓ Importance done.")
+    if "compare" in steps:
+        comp = cp.compare_vs_control(
+            control_label="ctl", group_col="treatment", stratify_by="cell_type"
+        )
+        if not comp.empty:
+            comp.to_csv(
+                os.path.join(args.output_dir, "compare_vs_ctl.csv"), index=False
+            )
     outdir = args.output_dir
     os.makedirs(outdir, exist_ok=True)
 

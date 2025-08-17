@@ -393,11 +393,12 @@ def select_columns(df: pd.DataFrame, keep_cols: List[str]) -> pd.DataFrame:
     return df[present].copy()
 
 
-# remove outliers using IQR on area and intensity
+# remove outliers using z-scores on area and intensity
 def _log1p_series(s: pd.Series) -> pd.Series:
     """Return log1p(s) but guaranteed as a pandas Series with the same index."""
     arr = np.log1p(s.astype(float).to_numpy())
     return pd.Series(arr, index=s.index)
+
 
 def _robust_z(x: pd.Series) -> pd.Series:
     """Robust z-score using MAD (median absolute deviation)."""
@@ -440,7 +441,7 @@ def flag_outliers_per_group(
         out["qc_keep"] = True
     if "qc_reason" not in out.columns:
         out["qc_reason"] = ""
-    
+
     # If nothing to do, return a copy immediately (still a DataFrame)
     if not cols_mad_log and not mitotic_rule:
         return out
@@ -448,7 +449,9 @@ def flag_outliers_per_group(
     # Infer defaults for mitotic rule, if requested
     if mitotic_rule:
         if mitotic_intensity_col is None:
-            mitotic_intensity_col = _first_existing(out, [r"^nuc_.*Intensity.*MeanIntensity$"])
+            mitotic_intensity_col = _first_existing(
+                out, [r"^nuc_.*Intensity.*MeanIntensity$"]
+            )
         if mitotic_area_col is None:
             mitotic_area_col = _first_existing(out, [r"^act_.*AreaShape_Area$"])
 
@@ -485,7 +488,9 @@ def flag_outliers_per_group(
                 s_area = out.loc[idx, mitotic_area_col].astype(float)
                 z_int = _robust_z(_log1p_series(s_int))
                 z_area = _robust_z(_log1p_series(s_area))
-                mask_m = ((z_int > mitotic_int_hi) & (z_area < mitotic_area_lo)).fillna(False)
+                mask_m = ((z_int > mitotic_int_hi) & (z_area < mitotic_area_lo)).fillna(
+                    False
+                )
                 if mask_m.any():
                     rows = mask_m.index[mask_m.to_numpy()]
                     out.loc[rows, "qc_keep"] = False
@@ -498,6 +503,7 @@ def flag_outliers_per_group(
     # <-- Always return a DataFrame
     return out
 
+
 def summarize_qc(
     out: pd.DataFrame, group_cols: Optional[List[str]] = None
 ) -> pd.DataFrame:
@@ -507,10 +513,11 @@ def summarize_qc(
         summary = gp.value_counts(dropna=False).unstack(fill_value=0)
     else:
         summary = out["qc_keep"].value_counts(dropna=False).to_frame().T
-    # Ensure both columns exist
+
     for col in [True, False]:
         if col not in summary.columns:
             summary[col] = 0
+
     summary = summary.rename(columns={True: "kept", False: "removed"})
     summary["total"] = summary["kept"] + summary["removed"]
     summary["removed_pct"] = (summary["removed"] / summary["total"] * 100.0).round(2)
