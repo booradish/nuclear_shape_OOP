@@ -20,15 +20,16 @@ fallbacks defined here are used so you can run end-to-end right away.
 from __future__ import annotations
 from numpy.typing import NDArray
 from scipy import stats
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, cast
 from pandas.api.types import is_numeric_dtype
+from pandas import CategoricalDtype
 
 import matplotlib.pyplot as plt
 import numpy as np
 import os
 import re
-import pandas as pd
 import seaborn as sns
+import pandas as pd
 
 
 # -------------------import tools from nuclear_shape_tools.py-------------------
@@ -97,7 +98,6 @@ class Nuclear_Shape_Analysis:
             "FileName_Nuc",
         ]
 
-        self.convert_coordinates = convert_coordinates
         self.qc_mode = qc_mode
         self.qc_drop = qc_drop
         self.add_aspect_ratio_flag = add_aspect_ratio
@@ -106,12 +106,8 @@ class Nuclear_Shape_Analysis:
         self.file_column = file_column
         self.pixel_size_um = pixel_size_um
         self.convert_coordinates = convert_coordinates
-        self.random_state = random_state
-        self.n_jobs = n_jobs
 
         self.df: Optional[pd.DataFrame] = None
-        self.df_clean: Optional[pd.DataFrame] = None
-        self.df_trimmed: Optional[pd.DataFrame] = None
 
         self.normalize_mode = normalize_mode
         self.normalize_by_group = normalize_by_group
@@ -153,12 +149,15 @@ class Nuclear_Shape_Analysis:
     # ------------------- helpers for methods -------------------
 
     def df_for_analysis(self) -> pd.DataFrame:
-        """One source of truth for analysis steps."""
-        if self.df_trimmed is not None:
-            return self.df_trimmed
-        if self.df_clean is not None:
-            return self.df_clean
-        raise RuntimeError("No data available; run load_and_clean().")
+        """Return a DataFrame for analysis, or raise if none available."""
+        df = (
+            self.df_trimmed
+            if isinstance(self.df_trimmed, pd.DataFrame)
+            else self.df_clean
+        )
+        if not isinstance(df, pd.DataFrame):
+            raise RuntimeError("No data available; run load_and_clean().")
+        return df
 
     def _ensure_feature_lists(self) -> None:
         """Populate self.cols['id'/'nuc'/'act'] from the current analysis DF if missing."""
@@ -286,22 +285,35 @@ class Nuclear_Shape_Analysis:
 
     # remove unwanted feature columns
     def trim_features(self, feature_cols: List[str]) -> None:
-        """Keep only meta columns + selected feature columns (or all numeric fallback)."""
+        """Keep only metadata + selected feature columns (or all numeric fallback)."""
         if self.df is None:
             raise RuntimeError("Data not loaded. Call load_and_clean() first.")
-        meta = [
+
+        # meta columns we ALWAYS keep in trimmed tables
+        always_keep = [
             c
-            for c in ["ImageNumber", "ObjectNumber", "group", "FileName"]
+            for c in [
+                "ImageNumber",
+                "ObjectNumber",
+                "FileName",
+                "group",        # composite label (cell_type + '_' + treatment)
+                "cell_type",    # needed by plot_by_celltype and comparisons
+                "treatment",    # needed by plotting & comparisons
+            ]
             if c in self.df.columns
         ]
+
+        # the features the user asked for (if present)
         feats = [c for c in feature_cols if c in self.df.columns]
+
+        # if none provided, keep all numeric columns EXCEPT meta
         if not feats:
-            feats = [
-                c
-                for c in self.df.select_dtypes(include=[np.number]).columns
-                if c not in meta
-            ]
-        self.df_trimmed = self.df[meta + feats].copy()
+            numeric = list(self.df.select_dtypes(include=[np.number]).columns)
+            feats = [c for c in numeric if c not in always_keep]
+
+        # build trimmed view
+        self.df_trimmed = self.df[always_keep + feats].copy()
+
 
     def run_stats(self) -> None:
         """
@@ -313,16 +325,15 @@ class Nuclear_Shape_Analysis:
         - by_group_wide_mean
         - by_group_wide_mean_sem
         """
-        # Choose the table in a way that narrows the type for Pylance
-        if self.use_norm_for_stats and isinstance(self.df_norm, pd.DataFrame):
-            df: pd.DataFrame = self.df_norm
-        else:
-            df = self.df_for_analysis()  # must return a DataFrame or raise
-
-        # Ensure feature lists are populated (id/nuc/act)
+        # pick DF
+        df: pd.DataFrame = (
+            self.df_norm
+            if (self.use_norm_for_stats and isinstance(self.df_norm, pd.DataFrame))
+            else self.df_for_analysis()
+        )
         self._ensure_feature_lists()
 
-        # --- choose numeric feature columns (drop metadata/IDs) ---
+        # numeric feature columns (drop IDs/metadata)
         id_set = set(self.cols.get("id", []))
         num_cols = [
             c for c in df.columns if c not in id_set and is_numeric_dtype(df[c])
@@ -334,115 +345,94 @@ class Nuclear_Shape_Analysis:
             return
         num_df = df[num_cols].copy()
 
-        # --- helper stats (typed & robust to non-numeric via coercion) ---
-        def _to_num(x: pd.Series) -> pd.Series:
-            return pd.to_numeric(x, errors="coerce")
+        # ---------- OVERALL ----------
+        # basic reducers first (no custom functions here)
+        basic = num_df.agg(["count", "mean", "std", "median"]).T
 
-        def sem(x: pd.Series) -> float:
-            s = _to_num(x)
+        # sem (as Series aligned to basic.index)
+        def _sem_col(s: pd.Series) -> float:
+            s = pd.to_numeric(s, errors="coerce")
             n = int(s.count())
             return float(s.std(ddof=1) / np.sqrt(n)) if n > 0 else np.nan
 
-        def ci_low(x: pd.Series) -> float:
-            s = _to_num(x)
-            n = int(s.count())
-            if n <= 1:
-                return np.nan
-            m = float(s.mean())
-            sd = float(s.std(ddof=1))
-            if not np.isfinite(sd):
-                return np.nan
-            return float(m - 1.96 * sd / np.sqrt(n))
+        sem_s = num_df.apply(_sem_col, axis=0).reindex(basic.index)
 
-        def ci_high(x: pd.Series) -> float:
-            s = _to_num(x)
-            n = int(s.count())
-            if n <= 1:
-                return np.nan
-            m = float(s.mean())
-            sd = float(s.std(ddof=1))
-            if not np.isfinite(sd):
-                return np.nan
-            return float(m + 1.96 * sd / np.sqrt(n))
+        # IQR from separate quantiles (avoids list[float] stub issue)
+        q25 = num_df.quantile(0.25, numeric_only=True).reindex(basic.index)
+        q75 = num_df.quantile(0.75, numeric_only=True).reindex(basic.index)
+        iqr_s = q75 - q25
 
-        def iqr(x: pd.Series) -> float:
-            s = _to_num(x).dropna()
-            if s.empty:
-                return np.nan
-            arr = s.to_numpy(dtype=float)
-            return float(np.percentile(arr, 75) - np.percentile(arr, 25))
+        ci95_low = basic["mean"] - 1.96 * sem_s
+        ci95_high = basic["mean"] + 1.96 * sem_s
 
-        agg_funcs = ["count", "mean", "std", sem, ci_low, ci_high, "median", iqr]
-        stat_names = [
-            "count",
-            "mean",
-            "std",
-            "sem",
-            "ci_low",
-            "ci_high",
-            "median",
-            "iqr",
-        ]
-
-        # --- overall (all rows) ---
-        overall = num_df.agg(agg_funcs).T
-        overall.columns = stat_names
-
-        # Optional: rename to ci95_* for reporting
-        # overall = overall.rename(columns={"ci_low": "ci95_low", "ci_high": "ci95_high"})
+        overall = pd.DataFrame(
+            {
+                "count": pd.Series(basic["count"].astype(float), index=basic.index),
+                "mean": pd.Series(basic["mean"], index=basic.index),
+                "std": pd.Series(basic["std"], index=basic.index),
+                "sem": pd.Series(sem_s, index=basic.index),
+                "ci95_low": pd.Series(ci95_low, index=basic.index),
+                "ci95_high": pd.Series(ci95_high, index=basic.index),
+                "median": pd.Series(basic["median"], index=basic.index),
+                "iqr": pd.Series(iqr_s, index=basic.index),
+            }
+        )
 
         results: Dict[str, pd.DataFrame] = {"overall": overall}
 
-        # --- by group (e.g., HeLa_ctl, HeLa_ble, ...) ---
+        # ---------- BY GROUP ----------
         if "group" in df.columns:
-            g = df.groupby("group", observed=False)[num_cols].agg(
-                agg_funcs
-            )  # MultiIndex (feature, stat)
+            g = df.groupby("group", observed=False)
 
-            # flatten MultiIndex to f"{feature}__{stat}"
-            flat_cols = []
-            for feat, fn in g.columns.to_list():
-                name = fn if isinstance(fn, str) else fn.__name__
-                flat_cols.append(f"{feat}__{name}")
-            g_flat = g.copy()
-            g_flat.columns = flat_cols
-            g_flat = g_flat.reset_index()
+            mean_g = g[num_cols].mean()
+            count_g = g[num_cols].count()
+            std_g = g[num_cols].std(ddof=1)
+            median_g = g[num_cols].median()
 
-            # tidy long -> (feature, group) x stats
-            long = g_flat.melt(
-                id_vars=["group"], var_name="feature_stat", value_name="value"
+            # sem per group
+            sem_g = std_g.div(count_g.replace(0, np.nan).pow(0.5))
+
+            # IQR via separate quantiles (no list)
+            q25_g = g[num_cols].quantile(0.25)
+            q75_g = g[num_cols].quantile(0.75)
+            iqr_g = q75_g - q25_g
+
+            ci95_low_g = mean_g - 1.96 * sem_g
+            ci95_high_g = mean_g + 1.96 * sem_g
+
+            # build tidy long by stacking each table and merging
+            from functools import reduce
+
+            def _stack(name: str, d: pd.DataFrame) -> pd.DataFrame:
+                s = d.stack()
+                s.name = name  # <- avoid Series.rename typing issue
+                out = s.reset_index().rename(columns={"level_1": "feature"})
+                return out
+
+            parts = [
+                _stack("count", count_g),
+                _stack("mean", mean_g),
+                _stack("std", std_g),
+                _stack("sem", sem_g),
+                _stack("ci95_low", ci95_low_g),
+                _stack("ci95_high", ci95_high_g),
+                _stack("median", median_g),
+                _stack("iqr", iqr_g),
+            ]
+            by_group_long = reduce(
+                lambda L, R: pd.merge(L, R, on=["group", "feature"], how="outer"), parts
             )
-            long[["feature", "stat"]] = long["feature_stat"].str.split(
-                "__", n=1, expand=True
-            )
-            by_group_long = (
-                long.pivot_table(
-                    index=["feature", "group"],
-                    columns="stat",
-                    values="value",
-                    aggfunc="first",
-                )
-                .reset_index()
-                .reindex(columns=["feature", "group"] + stat_names)
-            )
-            by_group_long.columns.name = None
 
-            # Optional: rename to ci95_* for reporting
-            # by_group_long = by_group_long.rename(columns={"ci_low": "ci95_low", "ci_high": "ci95_high"})
+            # wide mean and pretty mean±sem
+            by_group_wide_mean = mean_g.T.sort_index()
+            by_group_wide_mean.index.name = "feature"
 
-            # wide mean
-            by_group_wide_mean = by_group_long.pivot(
-                index="feature", columns="group", values="mean"
-            ).sort_index()
-
-            # pretty "mean ± sem"
-            mean_sem = (
+            tmp = by_group_long[["feature", "group"]].copy()
+            tmp["mean_sem"] = (
                 by_group_long["mean"].round(3).astype(str)
                 + " ± "
                 + by_group_long["sem"].round(3).astype(str)
             )
-            tmp = by_group_long[["feature", "group"]].copy()
-            tmp["mean_sem"] = mean_sem
             by_group_wide_mean_sem = tmp.pivot(
                 index="feature", columns="group", values="mean_sem"
             ).sort_index()
@@ -565,41 +555,36 @@ class Nuclear_Shape_Analysis:
         random_state: int = 0,
     ) -> pd.DataFrame:
         """
-        For each feature in `columns`, draw:
-        - KDE histogram by treatment (ctl, ble, h11, y27)
-        - Dumbbell plot with mean ± 95% CI
-        Add cell line name in titles and filenames when `filter_cell_type` is set.
-        Save figures and return a tidy CSV-like DataFrame with per-group stats.
+        For each feature in `columns`, draw KDEs by treatment and a 'dumbbell' mean±CI plot.
+        Returns a tidy DataFrame of per-group stats and saves figures.
         """
-
-        # pick base table
+        # choose DataFrame
         if use_norm and isinstance(self.df_norm, pd.DataFrame):
             df: pd.DataFrame = self.df_norm
         else:
-            df = self.df_for_analysis()  # must return a DataFrame or raise
+            df = self.df_for_analysis()
 
-        # ensure group column exists
         if group_col not in df.columns:
             raise ValueError(f"Group column '{group_col}' not found in data.")
 
-        # optional restrict by cell type
+        # optional cell-type restriction
         if filter_cell_type is not None and "cell_type" in df.columns:
             df = df[df["cell_type"].astype(str) == str(filter_cell_type)]
 
-        # resolve requested columns (allow your old 'cell_' → new 'act_' mapping)
-        cols = []
+        # map old 'cell_' to 'act_' prefix and keep only existing columns
+        col_list: list[str] = []
         for c in columns:
-            cols.append("act_" + c[len("cell_") :] if c.startswith("cell_") else c)
-        cols = [c for c in cols if c in df.columns]
-        if not cols:
+            col_list.append("act_" + c[len("cell_") :] if c.startswith("cell_") else c)
+        col_list = [c for c in col_list if c in df.columns]
+        if not col_list:
             raise ValueError("None of the requested columns exist in the DataFrame.")
 
-        # palette / labels / order (lowercase keys, we’ll lower() group values)
+        # palette / labels / consistent order
         palette = {
-            "ctl": "#AB6621",  # Tiger's eye
-            "ble": "#375D6D",  # Payne's gray
-            "h11": "#470A14",  # Chocolate cosmos
-            "y27": "#5F5B44",  # Ebony
+            "ctl": "#AB6621",
+            "ble": "#375D6D",
+            "h11": "#470A14",
+            "y27": "#5F5B44",
         }
         display = {
             "ctl": "Control",
@@ -608,14 +593,15 @@ class Nuclear_Shape_Analysis:
             "y27": "Y-27632",
         }
         order = ["ctl", "ble", "h11", "y27"]
-
         pretty_map = pretty_names or {}
 
-        # output dir
+        # output directory
         if save_dir is None:
             base_out = getattr(self, "output_dir", "outputs")
-            save_dir = os.path.join(base_out, "figures")
-        os.makedirs(save_dir, exist_ok=True)
+            save_dir_path: str = os.path.join(base_out, "figures")
+        else:
+            save_dir_path = str(save_dir)
+        os.makedirs(save_dir_path, exist_ok=True)
 
         # style
         plt.rcParams.update(
@@ -636,11 +622,11 @@ class Nuclear_Shape_Analysis:
         def bootstrap_ci(
             values: np.ndarray, func=np.nanmean, n=n_bootstrap
         ) -> tuple[float, float]:
-            values = values[np.isfinite(values)]
-            if values.size == 0:
+            vv = values[np.isfinite(values)]
+            if vv.size == 0:
                 return (np.nan, np.nan)
-            idx = rng.integers(0, values.size, size=(n, values.size))
-            stats_boot = func(values[idx], axis=1)
+            idx = rng.integers(0, vv.size, size=(n, vv.size))
+            stats_boot = func(vv[idx], axis=1)
             return float(np.percentile(stats_boot, 2.5)), float(
                 np.percentile(stats_boot, 97.5)
             )
@@ -659,24 +645,24 @@ class Nuclear_Shape_Analysis:
             )
             return float((np.mean(a) - np.mean(b)) / s) if s > 0 else np.nan
 
-        # helpers for titles/filenames when filtering a cell line
+        # suffix/prefix used in titles/filenames
         ct_prefix = f"{filter_cell_type} — " if filter_cell_type else ""
         ct_suffix = f"_{filter_cell_type}" if filter_cell_type else ""
 
-        all_rows: list[dict] = []
+        # summary rows accumulator
+        all_rows: list[dict[str, Any]] = []
 
-        # lower-cased group values used for selection
+        # cached lower-cased group labels for selection
         gvals = df[group_col].astype(str).str.lower()
 
-        for col in cols:
+        for col in col_list:
             label = pretty_map.get(col, col)
 
-            # collect per-treatment arrays
+            # per-treatment arrays
             series_by_group: dict[str, np.ndarray] = {}
             for g in order:
-                vals = pd.to_numeric(df.loc[gvals == g, col], errors="coerce").to_numpy(
-                    dtype=float
-                )
+                s: pd.Series = df.loc[gvals == g, col]  # ensure Series
+                vals = pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
                 series_by_group[g] = vals
 
             # KDE histogram
@@ -703,14 +689,21 @@ class Nuclear_Shape_Analysis:
             plt.grid(False)
             safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", col)
             plt.savefig(
-                os.path.join(save_dir, f"Hist_{safe}_byGroup{ct_suffix}.png"),
+                os.path.join(save_dir_path, f"Hist_{safe}_byGroup{ct_suffix}.png"),
                 dpi=300,
                 bbox_inches="tight",
             )
             plt.close()
 
-            # Stats + dumbbell
-            means, cvs, ci_lo, ci_hi, pvals, effects, ns = {}, {}, {}, {}, {}, {}, {}
+            # stats & summaries per group
+            means: dict[str, float] = {}
+            cvs: dict[str, float] = {}
+            ci_lo: dict[str, float] = {}
+            ci_hi: dict[str, float] = {}
+            pvals: dict[str, float] = {}
+            effects: dict[str, float] = {}
+            ns: dict[str, int] = {}
+
             ctl_vals = series_by_group["ctl"]
 
             for g in order:
@@ -723,7 +716,6 @@ class Nuclear_Shape_Analysis:
                     else np.nan
                 )
                 lo, hi = bootstrap_ci(vals)
-
                 means[g], cvs[g], ci_lo[g], ci_hi[g], ns[g] = (
                     mu,
                     cv,
@@ -736,18 +728,21 @@ class Nuclear_Shape_Analysis:
                     pvals[g], effects[g] = np.nan, np.nan
                 else:
                     if ctl_vals.size >= 2 and vals.size >= 2:
-                        t, p = stats.ttest_ind(
+                        res = stats.ttest_ind(
                             vals[np.isfinite(vals)],
                             ctl_vals[np.isfinite(ctl_vals)],
                             equal_var=False,
                             nan_policy="omit",
                         )
-                        pvals[g] = float(p)
+                        p_any = getattr(res, "pvalue", None)
+                        if p_any is None:               # tuple-like result
+                            p_any = res[1]              # type: ignore[index]
+                        pvals[g] = float(np.asarray(p_any).item())
+
                         effects[g] = cohen_d(ctl_vals, vals)
                     else:
                         pvals[g], effects[g] = np.nan, np.nan
 
-                # add summary row
                 all_rows.append(
                     {
                         "feature": col,
@@ -767,15 +762,22 @@ class Nuclear_Shape_Analysis:
                     }
                 )
 
-            # dumbbell plot
-            plt.figure(figsize=(3.8, 5.0))
-            for g in order:
+            # Dumbbell plot with numeric x positions (keeps type checker happy)
+            fig, ax = plt.subplots(figsize=(3.8, 5.0))
+            xs = []
+            ys = []
+            for i, g in enumerate(order):
                 if not np.isfinite(means[g]):
                     continue
-                plt.errorbar(
-                    y=means[g],
-                    x=display[g],
-                    yerr=[[means[g] - ci_lo[g]], [ci_hi[g] - means[g]]],
+                xs.append(i)
+                ys.append(means[g])
+                yerr = np.array(
+                    [[means[g] - ci_lo[g]], [ci_hi[g] - means[g]]], dtype=float
+                )
+                ax.errorbar(
+                    i,
+                    means[g],
+                    yerr=yerr,
                     fmt="o",
                     color=palette[g],
                     capsize=5,
@@ -783,26 +785,26 @@ class Nuclear_Shape_Analysis:
                     linewidth=2,
                     capthick=2,
                 )
-            xs = [display[g] for g in order if np.isfinite(means[g])]
-            ys = [means[g] for g in order if np.isfinite(means[g])]
             if len(xs) >= 2:
-                plt.plot(xs, ys, color="gray", linestyle="--", linewidth=1)
+                ax.plot(xs, ys, color="gray", linestyle="--", linewidth=1)
 
-            plt.ylabel(label)
-            plt.xlabel("")
-            plt.title(f"{ct_prefix}Mean {label} by Group (95% CI)")
-            plt.grid(True, axis="y", alpha=0.3)
-            plt.xticks(rotation=30)
-            plt.tight_layout()
-            plt.savefig(
-                os.path.join(save_dir, f"Dumbbell_{safe}_byGroup{ct_suffix}.png"),
+            ax.set_ylabel(label)
+            ax.set_xlabel("")
+            ax.set_title(f"{ct_prefix}Mean {label} by Group (95% CI)")
+            ax.grid(True, axis="y", alpha=0.3)
+            xticks = np.arange(float(len(order)), dtype=float)  # 0.0, 1.0, 2.0, 3.0
+            ax.set_xticks(xticks.tolist())
+            ax.set_xticklabels([display[g] for g in order], rotation=30)
+            fig.tight_layout()
+            fig.savefig(
+                os.path.join(save_dir_path, f"Dumbbell_{safe}_byGroup{ct_suffix}.png"),
                 dpi=300,
                 bbox_inches="tight",
             )
-            plt.close()
+            plt.close(fig)
 
         summary = pd.DataFrame(all_rows)
-        out_csv = os.path.join(save_dir, f"plots_summary{ct_suffix or ''}.csv")
+        out_csv = os.path.join(save_dir_path, f"plots_summary{ct_suffix or ''}.csv")
         summary.to_csv(out_csv, index=False)
         return summary
 
@@ -817,21 +819,16 @@ class Nuclear_Shape_Analysis:
         random_state: int = 0,
     ) -> pd.DataFrame:
         """
-        Convenience wrapper: run `plot_group_distributions` once per cell_type.
-        Each figure filename and title includes the cell line.
-        Returns one combined summary DataFrame.
+        Run `plot_group_distributions` once per cell_type.
+        Filenames/titles include the cell line. Returns a combined summary DataFrame.
         """
-        import os
-
-        df = (
-            self.df_norm
-            if (use_norm and getattr(self, "df_norm", None) is not None)
-            else self.df_for_analysis()
-        )
+        if use_norm and isinstance(self.df_norm, pd.DataFrame):
+            df: pd.DataFrame = self.df_norm
+        else:
+            df = self.df_for_analysis()
 
         if "cell_type" not in df.columns:
-            # no cell_type present: single run
-            return self.plot_group_distributions(
+            res = self.plot_group_distributions(
                 columns=columns,
                 pretty_names=pretty_names,
                 group_col=group_col,
@@ -841,9 +838,9 @@ class Nuclear_Shape_Analysis:
                 n_bootstrap=n_bootstrap,
                 random_state=random_state,
             )
+            return res
 
-        # unique, stable order of cell types
-        if pd.api.types.is_categorical_dtype(df["cell_type"]):
+        if isinstance(df["cell_type"].dtype, CategoricalDtype):
             levels = [str(x) for x in df["cell_type"].cat.categories]
         else:
             levels = sorted(df["cell_type"].dropna().astype(str).unique())
@@ -853,9 +850,8 @@ class Nuclear_Shape_Analysis:
         )
         os.makedirs(base_dir, exist_ok=True)
 
-        parts = []
+        parts: list[pd.DataFrame] = []
         for ct in levels:
-            # put all figures in the same folder, but suffix filenames with cell line
             s = self.plot_group_distributions(
                 columns=columns,
                 pretty_names=pretty_names,
@@ -909,13 +905,9 @@ class Nuclear_Shape_Analysis:
         y_col = numeric_cols[0]
         X_cols = numeric_cols[1:]
 
-        # coerce to numeric and to NumPy arrays
-        y: NDArray[np.float64] = pd.to_numeric(df[y_col], errors="coerce").to_numpy(
-            dtype=float
-        )
-        X: NDArray[np.float64] = (
-            df[X_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-        )
+        # coerce to numpy arrays directly (columns are numeric dtypes already)
+        y: NDArray[np.float64] = df[y_col].to_numpy(dtype=float)
+        X: NDArray[np.float64] = df[X_cols].to_numpy(dtype=float)
 
         # drop rows with any NaN/inf
         valid_mask = np.isfinite(y) & np.isfinite(X).all(axis=1)
@@ -1021,6 +1013,3 @@ class Nuclear_Shape_Analysis:
                 suffix = "..." if df.shape[1] > 8 else ""
                 parts.append(f"{name}: shape={df.shape}, cols={cols_preview}{suffix}")
         return " | ".join(parts)
-
-
-# -------------------------- utilities --------------------------
