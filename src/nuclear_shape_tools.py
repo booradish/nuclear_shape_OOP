@@ -103,7 +103,6 @@ def add_group_columns(
 
     # build a text field per row for matching
     if filename_col in out.columns:
-        base = out[filename_col].astype(str)
         pcols = path_cols or [c for c in out.columns if c.startswith("PathName_")]
         cols_to_join = [filename_col] + pcols
     else:
@@ -338,6 +337,80 @@ def convert_units(
     return out
 
 
+# -------------------- columns to exclude from analysis --------------------
+
+
+EXCLUDE_ANALYSIS_PATTERNS = [
+    r"^ImageNumber$",
+    r"^ObjectNumber$",
+    r"^FileName",
+    r"^PathName",
+    r"^Metadata_",  # any Metadata_* column
+    r"^Parent_",  # any Parent_* column
+    r"(Location|Center|Centroid)",
+    r"BoundingBox",
+    r"(_X|_Y|_Z)$",  # trailing coordinate components
+    r"^group$",
+    r"^cell_type$",
+    r"^treatment$",
+    r"^qc_keep$",
+    r"^qc_reason$",
+]
+
+
+def id_like_columns(df: pd.DataFrame) -> List[str]:
+    pats = [
+        r"^ImageNumber$",
+        r"^ObjectNumber$",
+        r"^FileName",
+        r"^PathName",
+        r"^Metadata_",
+    ]
+    ids = [c for c in df.columns if any(re.search(p, c, flags=re.I) for p in pats)]
+    ids += [
+        c
+        for c in ["FileName", "group", "cell_type", "treatment", "qc_keep", "qc_reason"]
+        if c in df.columns
+    ]
+    # de-dup preserve order
+    seen, out = set(), []
+    for c in ids:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+
+def feature_columns(
+    df: pd.DataFrame, prefix: str, exclude_patterns: Optional[List[str]] = None
+) -> List[str]:
+    cols = [
+        c for c in df.columns if c.startswith(prefix + "_") and is_numeric_dtype(df[c])
+    ]
+    pats = (exclude_patterns or []) + EXCLUDE_ANALYSIS_PATTERNS
+    keep = [c for c in cols if not any(re.search(p, c, flags=re.I) for p in pats)]
+    return keep
+
+
+def trim_to_analysis(
+    df: pd.DataFrame,
+    nuc_prefix: str = "nuc",
+    act_prefix: str = "act",
+    extra_exclude: Optional[List[str]] = None,
+    keep_meta: bool = True,
+) -> tuple[pd.DataFrame, List[str], List[str], List[str]]:
+    """
+    Return (trimmed_df, id_cols, nuc_feature_cols, act_feature_cols).
+    Keeps ID/metadata columns (if keep_meta=True) + nuc_* and act_* numeric features, excluding coords/metadata.
+    """
+    ids = id_like_columns(df)
+    nuc = feature_columns(df, nuc_prefix, exclude_patterns=extra_exclude)
+    act = feature_columns(df, act_prefix, exclude_patterns=extra_exclude)
+    keep = (ids if keep_meta else []) + nuc + act
+    keep = [c for c in keep if c in df.columns]
+    return df.loc[:, keep].copy(), ids, nuc, act
+
+
 # -------------------- additional metrics --------------------
 
 
@@ -522,3 +595,79 @@ def summarize_qc(
     summary["total"] = summary["kept"] + summary["removed"]
     summary["removed_pct"] = (summary["removed"] / summary["total"] * 100.0).round(2)
     return summary.reset_index()
+
+
+# ---------------------------- Normalize --------------------------------------
+
+# columns to EXCLUDE from normalization (regex, case-insensitive)
+EXCLUDE_NORM_PATTERNS: List[str] = [
+    r"^ImageNumber$",
+    r"^ObjectNumber$",
+    r"^Metadata_",
+    r"^FileName",
+    r"^PathName",
+    r"Hu",  # Hu moments
+    r"Zernike",  # (often dimensionless; skip)
+    r"BoundingBox",  # bbox sizes/coords
+    r"(Location|Center|Centroid)",  # coordinates-ish
+    r"(_X|_Y|_Z)$",  # any trailing coordinate component
+]
+
+
+def _norm_candidate_cols(
+    df: pd.DataFrame, extra_exclude: Optional[Iterable[str]] = None
+) -> List[str]:
+    cols = [c for c in df.columns if is_numeric_dtype(df[c])]
+    pats = EXCLUDE_NORM_PATTERNS + list(extra_exclude or [])
+    keep = []
+    for c in cols:
+        if any(re.search(p, c, flags=re.I) for p in pats):
+            continue
+        keep.append(c)
+    return keep
+
+
+def add_normalized_columns(
+    df: pd.DataFrame,
+    method: str = "zscore",  # "zscore" or "robust"
+    by: Optional[List[str]] = None,  # e.g., ["cell_type","treatment"] or None
+    suffix: str = "_z",
+    extra_exclude: Optional[Iterable[str]] = None,
+) -> pd.DataFrame:
+    """
+    Create normalized copies of selected numeric columns and append them with `suffix`.
+    Excludes ID/coords/Hu/Zernike/etc. by default.
+    Does not overwrite originals.
+    """
+    out = df.copy()
+    cols = _norm_candidate_cols(out, extra_exclude=extra_exclude)
+    if not cols:
+        return out
+
+    def zscore(sub: pd.DataFrame) -> pd.DataFrame:
+        mu = sub.mean(numeric_only=True)
+        sd = sub.std(ddof=0, numeric_only=True).replace(0, np.nan)
+        return (sub - mu) / sd
+
+    def robust(sub: pd.DataFrame) -> pd.DataFrame:
+        med = sub.median(numeric_only=True)
+        mad = (sub.sub(med)).abs().median(numeric_only=True).replace(0, np.nan)
+        return (sub - med) / (1.4826 * mad)
+
+    if by:
+        # normalize within each group
+        for _, idx in out.groupby(by, dropna=False, observed=False).groups.items():
+            sub = out.loc[idx, cols].astype(float)
+            if method == "robust":
+                norm = robust(sub)
+            else:
+                norm = zscore(sub)
+            norm.columns = [f"{c}{suffix}" for c in cols]
+            out.loc[idx, norm.columns] = norm.values
+    else:
+        sub = out[cols].astype(float)
+        norm = robust(sub) if method == "robust" else zscore(sub)
+        norm.columns = [f"{c}{suffix}" for c in cols]
+        out = pd.concat([out, norm], axis=1)
+
+    return out

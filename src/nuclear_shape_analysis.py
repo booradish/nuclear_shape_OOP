@@ -18,10 +18,9 @@ fallbacks defined here are used so you can run end-to-end right away.
 """
 
 from __future__ import annotations
-from numpy.typing import NDArray
 from scipy import stats
-from typing import List, Optional, Dict, Any, cast
-from pandas.api.types import is_numeric_dtype
+from typing import List, Optional, Dict, Any, Sequence, Union
+from pandas.api.types import is_numeric_dtype, is_bool_dtype
 from pandas import CategoricalDtype
 
 import matplotlib.pyplot as plt
@@ -141,8 +140,11 @@ class Nuclear_Shape_Analysis:
         self.n_rows_after: int = 0
 
         # ---- results ----
+        self.output_dir: Optional[str] = None
         self.stats_results: Optional[Dict[str, pd.DataFrame]] = None
-        self.regression_results: Optional[Dict[str, pd.DataFrame]] = None
+        self.regression_results: Optional[
+            Dict[str, Union[pd.DataFrame, Dict[str, pd.DataFrame]]]
+        ] = None
         self.random_forest_results: Optional[pd.DataFrame] = None
         self.compare_results: Optional[pd.DataFrame] = None
 
@@ -173,7 +175,37 @@ class Nuclear_Shape_Analysis:
                 self.df_trimmed = trimmed
             self.cols = {"id": ids, "nuc": nuc, "act": act}
 
-    # -------------------analysis methods in this class-------------------
+    def _df_analysis(
+        self,
+        use_norm: bool = False,
+        filter_cell_types: Sequence[str] | None = None,
+    ) -> pd.DataFrame:
+        """Return the table to analyze, optionally normalized and/or filtered by cell_type."""
+        df = (
+            self.df_norm
+            if (use_norm and isinstance(self.df_norm, pd.DataFrame))
+            else self.df_for_analysis()
+        )
+        if filter_cell_types and "cell_type" in df.columns:
+            wanted = [str(x) for x in filter_cell_types]
+            df = df[df["cell_type"].astype(str).isin(wanted)]
+        return df
+
+    def _coerce_numeric_df(self, df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+        return df[cols].apply(pd.to_numeric, errors="coerce").astype(float)
+
+    def _impute_with_median(self, X: pd.DataFrame) -> pd.DataFrame:
+        med = X.median(axis=0, numeric_only=True)
+        return X.fillna(med)
+
+    def _std_scale(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        mean = np.nanmean(X, axis=0)
+        std = np.nanstd(X, axis=0, ddof=1)
+        std[~np.isfinite(std)] = 1.0
+        std[std == 0.0] = 1.0
+        return (X - mean) / std, mean, std
+
+    # ------------------- data cleaning methods in this class-------------------
 
     def load_and_clean(self) -> None:
         # load
@@ -296,9 +328,9 @@ class Nuclear_Shape_Analysis:
                 "ImageNumber",
                 "ObjectNumber",
                 "FileName",
-                "group",        # composite label (cell_type + '_' + treatment)
-                "cell_type",    # needed by plot_by_celltype and comparisons
-                "treatment",    # needed by plotting & comparisons
+                "group",  # composite label (cell_type + '_' + treatment)
+                "cell_type",  # needed by plot_by_celltype and comparisons
+                "treatment",  # needed by plotting & comparisons
             ]
             if c in self.df.columns
         ]
@@ -314,6 +346,7 @@ class Nuclear_Shape_Analysis:
         # build trimmed view
         self.df_trimmed = self.df[always_keep + feats].copy()
 
+    # ------------------- statistical analysis methods in this class-------------------
 
     def run_stats(self) -> None:
         """
@@ -334,16 +367,23 @@ class Nuclear_Shape_Analysis:
         self._ensure_feature_lists()
 
         # numeric feature columns (drop IDs/metadata)
+        self._ensure_feature_lists()
         id_set = set(self.cols.get("id", []))
+
         num_cols = [
-            c for c in df.columns if c not in id_set and is_numeric_dtype(df[c])
+            c for c in df.columns
+            if c not in id_set
+            and is_numeric_dtype(df[c])
+            and not is_bool_dtype(df[c])  # exclude boolean flags like qc_keep
         ]
+
         if not num_cols:
-            self.stats_results = {
-                "note": pd.DataFrame([{"msg": "No numeric features"}])
-            }
+            self.stats_results = {"note": pd.DataFrame([{"msg": "No numeric features"}])}
             return
+
         num_df = df[num_cols].copy()
+        # optional: drop columns that are entirely NaN to avoid “mean of empty slice” spam
+        num_df = num_df.loc[:, num_df.notna().any(axis=0)]
 
         # ---------- OVERALL ----------
         # basic reducers first (no custom functions here)
@@ -735,8 +775,8 @@ class Nuclear_Shape_Analysis:
                             nan_policy="omit",
                         )
                         p_any = getattr(res, "pvalue", None)
-                        if p_any is None:               # tuple-like result
-                            p_any = res[1]              # type: ignore[index]
+                        if p_any is None:  # tuple-like result
+                            p_any = res[1]  # type: ignore[index]
                         pvals[g] = float(np.asarray(p_any).item())
 
                         effects[g] = cohen_d(ctl_vals, vals)
@@ -868,77 +908,277 @@ class Nuclear_Shape_Analysis:
 
         return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
+    # ------------------- PCA and dimensionality reduction methods -------------------
+
+    def run_pca(
+        self,
+        predictors: str = "act",                # "act" → cell features, "nuc" → nuclear features
+        use_norm: bool = True,                  # use normalized copy if available
+        filter_cell_types: list[str] | None = None,  # run on all rows or per provided cell types
+        n_components: int | None = None,        # None = all components
+        var_tol: float = 1e-12,                 # drop near-constant columns
+    ) -> None:
+        """
+        Robust PCA on chosen predictor feature block. Cleans data, prevents SVD failures,
+        and falls back to covariance eigen-decomposition if needed.
+        Saves results in self.pca_results (overall) and self.pca_by_celltype (optional).
+        """
+        # pick base DataFrame
+        base = self.df_norm if (use_norm and isinstance(self.df_norm, pd.DataFrame)) else self.df_for_analysis()
+
+        # ensure feature lists exist
+        self._ensure_feature_lists()
+        if predictors.lower() == "act":
+            feat_cols = list(self.cols.get("act", []))
+        elif predictors.lower() == "nuc":
+            feat_cols = list(self.cols.get("nuc", []))
+        else:
+            raise ValueError("predictors must be 'act' or 'nuc'")
+
+        # keep only numeric, non-boolean columns that exist
+        feat_cols = [c for c in feat_cols if c in base.columns and is_numeric_dtype(base[c]) and not is_bool_dtype(base[c])]
+        if not feat_cols:
+            print("[PCA] No numeric predictor columns found after filtering.")
+            self.pca_results = {}
+            return
+
+        def _clean_matrix(df: pd.DataFrame) -> tuple[np.ndarray, list[str], np.ndarray, np.ndarray, dict]:
+            """Return (Xs, cols_kept, mean, std, info) with robust cleaning."""
+            Xdf = df[feat_cols].copy()
+
+            # drop columns that are entirely NaN
+            all_nan = Xdf.isna().all(axis=0)
+            if all_nan.any():
+                Xdf = Xdf.loc[:, ~all_nan]
+
+            # drop boolean cols defensively (shouldn't exist now)
+            Xdf = Xdf.loc[:, [c for c in Xdf.columns if not is_bool_dtype(Xdf[c])]]
+
+            # if nothing left
+            if Xdf.shape[1] == 0:
+                return np.empty((0, 0)), [], np.array([]), np.array([]), {"dropped_all_nan": int(all_nan.sum()), "dropped_low_var": 0}
+
+            # impute NaNs by column median (numeric)
+            med = Xdf.median(numeric_only=True)
+            Xdf = Xdf.fillna(med)
+
+            # drop near-constant columns
+            std0 = Xdf.std(ddof=0)
+            low_var_mask = (std0.fillna(0.0).to_numpy() <= var_tol)
+            if low_var_mask.any():
+                Xdf = Xdf.loc[:, ~low_var_mask]
+                std0 = Xdf.std(ddof=0)
+
+            cols_kept = list(Xdf.columns)
+
+            # center / scale with epsilon
+            mean = Xdf.mean().to_numpy(dtype=float)
+            std = std0.to_numpy(dtype=float)
+            eps = 1e-12
+            std_safe = np.where(std > 0, std, 1.0)
+
+            X = Xdf.to_numpy(dtype=float)
+            if X.size == 0:
+                return np.empty((0, 0)), [], np.array([]), np.array([]), {
+                    "dropped_all_nan": int(all_nan.sum()),
+                    "dropped_low_var": int(low_var_mask.sum()) if isinstance(low_var_mask, np.ndarray) else 0
+                }
+
+            Xs = (X - mean) / (std_safe + eps)
+
+            info = {
+                "dropped_all_nan": int(all_nan.sum()),
+                "dropped_low_var": int((~np.isin(feat_cols, cols_kept)).sum()),
+                "n_rows_used": int(Xs.shape[0]),
+                "n_cols_used": int(Xs.shape[1]),
+            }
+            return Xs, cols_kept, mean, std_safe, info
+
+        def _pca_from_matrix(Xs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            """Compute PCA; try SVD, fall back to covariance eigendecomp on failure."""
+            if Xs.ndim != 2 or Xs.shape[0] < 2 or Xs.shape[1] < 2:
+                raise ValueError("Need at least 2 rows and 2 columns for PCA.")
+            try:
+                U, S, Vt = np.linalg.svd(Xs, full_matrices=False)  # shapes: (n,k), (k,), (k,k)
+                return U, S, Vt
+            except np.linalg.LinAlgError:
+                # fallback: eigen-decomposition of covariance
+                C = (Xs.T @ Xs) / max(1, (Xs.shape[0] - 1))  # (k,k) symmetric
+                w, V = np.linalg.eigh(C)                     # ascending
+                idx = np.argsort(w)[::-1]                    # descending
+                w = w[idx]
+                V = V[:, idx]
+                S = np.sqrt(np.clip(w * max(1, (Xs.shape[0] - 1)), a_min=0.0, a_max=None))
+                U = Xs @ V @ np.diag(1.0 / (S + 1e-12))      # back out scores-like U (n,k)
+                Vt = V.T
+                return U, S, Vt
+
+        def _package_results(Xs, U, S, Vt, cols, mean, std) -> dict:
+            n = Xs.shape[0]
+            var = (S ** 2) / max(1, (n - 1))
+            total = float(var.sum()) if var.size else 0.0
+            ratio = var / total if total > 0 else np.zeros_like(var)
+            if n_components is not None:
+                k = min(n_components, S.size)
+                U = U[:, :k]; S = S[:k]; Vt = Vt[:k, :]; var = var[:k]; ratio = ratio[:k]
+            scores = U * S  # (n, k)
+            return {
+                "X_cols": cols,
+                "mean": mean,
+                "std": std,
+                "Vt": Vt,
+                "scores": scores,
+                "explained_variance": var,
+                "explained_variance_ratio": ratio,
+            }
+
+        # --- run overall PCA (no per-cell-type filtering) ---
+        Xs, cols_kept, mean, std, info = _clean_matrix(base)
+        if Xs.shape[0] >= 2 and Xs.shape[1] >= 2:
+            U, S, Vt = _pca_from_matrix(Xs)
+            self.pca_results = _package_results(Xs, U, S, Vt, cols_kept, mean, std)
+        else:
+            self.pca_results = {}
+            print(f"[PCA] Skipped overall PCA: insufficient data (rows={Xs.shape[0]}, cols={Xs.shape[1]}).")
+
+        # --- optionally run PCA per cell type ---
+        self.pca_by_celltype: dict[str, dict] = {}
+        if filter_cell_types and "cell_type" in base.columns:
+            for ct in filter_cell_types:
+                sub = base[base["cell_type"].astype(str) == str(ct)]
+                Xs_ct, cols_ct, mean_ct, std_ct, info_ct = _clean_matrix(sub)
+                if Xs_ct.shape[0] >= 2 and Xs_ct.shape[1] >= 2:
+                    try:
+                        U_ct, S_ct, Vt_ct = _pca_from_matrix(Xs_ct)
+                        self.pca_by_celltype[ct] = _package_results(Xs_ct, U_ct, S_ct, Vt_ct, cols_ct, mean_ct, std_ct)
+                    except Exception as e:
+                        print(f"[PCA] Skipped {ct}: {e}")
+                else:
+                    print(f"[PCA] Skipped {ct}: insufficient data (rows={Xs_ct.shape[0]}, cols={Xs_ct.shape[1]}).")
+
+
     # ------------------- regression and random forest methods -------------------
 
-    def run_regression(self) -> None:
-        """
-        Toy least-squares regression:
-        - target = first numeric column
-        - predictors = remaining numeric columns
-        Returns coefficients and R^2. This is just a smoke-test regressor.
-        """
-        df = self.df_trimmed if self.df_trimmed is not None else self.df_clean
-        if df is None:
-            raise RuntimeError("No data available. Did you run load_and_clean()?")
+    def run_regression(
+        self,
+        targets: str = "nuc",  # predict nuclear features
+        predictors: str = "act",  # from cell features
+        n_components: int | None = None,
+        var_threshold: float | None = 0.95,  # keep PCs up to this variance
+        use_norm: bool = False,
+        filter_cell_types: Sequence[str] | None = None,
+    ) -> None:
+        """Regress each target feature on PCA scores of predictor features."""
+        # make sure PCA is ready and matches config
+        need_fit = (
+            getattr(self, "pca_results", None) is None
+            or self.pca_results.get("predictor_set") != predictors
+            or self.pca_results.get("used_norm") != bool(use_norm)
+            or (
+                filter_cell_types is not None
+                and self.pca_results.get("filtered_cell_types")
+                != list(filter_cell_types)
+            )
+        )
+        if need_fit:
+            self.run_pca(
+                predictors=predictors,
+                use_norm=use_norm,
+                filter_cell_types=filter_cell_types,
+            )
 
-        # choose numeric columns (exclude metadata)
-        meta = {
-            "ImageNumber",
-            "ObjectNumber",
-            "FileName",
-            "group",
-            "cell_type",
-            "treatment",
-        }
-        numeric_cols = [
-            c for c in df.columns if is_numeric_dtype(df[c]) and c not in meta
-        ]
+        df = self._df_analysis(use_norm=use_norm, filter_cell_types=filter_cell_types)
+        self._ensure_feature_lists()
+        Y_cols_all = self.cols.get(targets, [])
+        Y_cols = [c for c in Y_cols_all if c in df.columns and is_numeric_dtype(df[c])]
+        if not Y_cols:
+            raise RuntimeError(f"No numeric target columns found for '{targets}'.")
 
-        if len(numeric_cols) < 2:
-            self.regression_results = {
-                "meta": pd.DataFrame(
-                    [{"note": "Insufficient numeric features for regression."}]
+        X_cols = self.pca_results["X_cols"]
+        X_df = self._coerce_numeric_df(df, X_cols)
+        X_df = self._impute_with_median(X_df)
+        X = X_df.to_numpy(dtype=float)
+
+        Vt: np.ndarray = self.pca_results["Vt"]
+        var_ratio: np.ndarray = self.pca_results["explained_variance_ratio"]
+        scores_all: np.ndarray = self.pca_results["scores"]
+        std_pred: np.ndarray = self.pca_results["std"]
+
+        # choose number of PCs
+        if n_components is None:
+            var_threshold = 0.95 if var_threshold is None else float(var_threshold)
+            k = int(
+                np.searchsorted(np.cumsum(var_ratio), var_threshold, side="left") + 1
+            )
+        else:
+            k = int(max(1, min(n_components, Vt.shape[0])))
+
+        V_k = Vt[:k, :].T  # (n_features x k)
+        Z = scores_all[:, :k]  # (m x k)
+        var_expl = float(var_ratio[:k].sum())
+
+        coef_rows: list[dict[str, float | str | int]] = []
+        met_rows: list[dict[str, float | str | int]] = []
+
+        for y_name in Y_cols:
+            y = pd.to_numeric(df[y_name], errors="coerce").astype(float).to_numpy()
+            mask = np.isfinite(y)
+            if mask.sum() < (k + 2):
+                met_rows.append(
+                    {
+                        "target": y_name,
+                        "r2": np.nan,
+                        "n": int(mask.sum()),
+                        "n_components": k,
+                        "var_explained": var_expl,
+                    }
                 )
-            }
-            return
+                continue
 
-        y_col = numeric_cols[0]
-        X_cols = numeric_cols[1:]
+            y_m = y[mask]
+            Z_m = Z[mask, :]
+            X_m = X[mask, :]
 
-        # coerce to numpy arrays directly (columns are numeric dtypes already)
-        y: NDArray[np.float64] = df[y_col].to_numpy(dtype=float)
-        X: NDArray[np.float64] = df[X_cols].to_numpy(dtype=float)
+            # y = a + Z_m @ gamma  (least squares)
+            A = np.column_stack([np.ones(Z_m.shape[0], dtype=float), Z_m])
+            beta_pc, _, _, _ = np.linalg.lstsq(A, y_m, rcond=None)
+            gamma = beta_pc[1:]  # (k,)
 
-        # drop rows with any NaN/inf
-        valid_mask = np.isfinite(y) & np.isfinite(X).all(axis=1)
-        y = y[valid_mask]
-        X = X[valid_mask]
+            # back-transform PC coefs to original predictor features
+            beta_std = V_k @ gamma  # on standardized X
+            beta_orig = beta_std / std_pred  # original X units
 
-        if y.size < 2 or X.shape[1] == 0 or X.shape[0] != y.size:
-            self.regression_results = {
-                "meta": pd.DataFrame(
-                    [{"note": "Not enough valid rows after cleaning."}]
-                )
-            }
-            return
+            # intercept in original space
+            mu_x = X_m.mean(axis=0)
+            intercept = float(y_m.mean() - float(np.dot(beta_orig, mu_x)))
 
-        # add intercept column
-        ones = np.ones((X.shape[0], 1), dtype=float)
-        X_design: NDArray[np.float64] = np.concatenate([ones, X], axis=1)
+            # R^2
+            y_hat = intercept + X_m @ beta_orig
+            ss_tot = float(np.sum((y_m - y_m.mean()) ** 2))
+            ss_res = float(np.sum((y_m - y_hat) ** 2))
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
-        # solve least squares y ~ [1, X] beta
-        beta, residuals, rank, s = np.linalg.lstsq(X_design, y, rcond=None)
+            # store
+            coef_rows.append({"target": y_name, "term": "intercept", "coef": intercept})
+            for feat, b in zip(X_cols, beta_orig, strict=False):
+                coef_rows.append({"target": y_name, "term": feat, "coef": float(b)})
 
-        # fit stats
-        y_hat = X_design @ beta
-        ss_tot = float(np.sum((y - y.mean()) ** 2))
-        ss_res = float(np.sum((y - y_hat) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+            met_rows.append(
+                {
+                    "target": y_name,
+                    "r2": r2,
+                    "n": int(y_m.size),
+                    "n_components": int(k),
+                    "var_explained": var_expl,
+                }
+            )
 
-        coef_df = pd.DataFrame({"term": ["intercept"] + X_cols, "coef": beta})
-        metrics_df = pd.DataFrame([{"target": y_col, "r2": r2, "n": int(y.size)}])
+        coef_df = pd.DataFrame(coef_rows)
+        met_df = pd.DataFrame(met_rows)
 
-        self.regression_results = {"coefficients": coef_df, "metrics": metrics_df}
+        if self.regression_results is None:
+            self.regression_results = {}
+        self.regression_results["pca"] = {"coefficients": coef_df, "metrics": met_df}
 
     def run_random_forest(self) -> None:
         """
